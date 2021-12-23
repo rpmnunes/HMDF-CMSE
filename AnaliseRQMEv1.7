@@ -1,0 +1,357 @@
+' Mestrado em Ciência da Computação - UNIFACCAMP
+' Autor: Roberto Paulo Moreira Nunes
+' Orientador: Ferrucio de Franco Rosa
+' rpmnunes72@gmail.com
+' Novembro 2021
+' Versão: 1.7
+
+' Programa auxiliar, para avaliação de hipóteses e técnicas, na detecção de similaridade ou fraude em 
+' respostas de múltipla escolha. Componente do método de detecção de fraude em concurso público.
+' Após definida a(s) técnicas empregadas, foi empregado na geração dos índices de suspeição parciais, que
+' compõem a aplicação do método de detecção (MHDFCP).
+
+Imports System.Data.SqlClient
+Imports System.Math
+
+Public NotInheritable Class MainPage
+    Inherits Page
+
+    ' Define variáveis e enumeradores locais
+    Private StringConexao As String =
+        "Initial Catalog=MDFCP;Data Source=DESKTOP-BSTAHC9\MSSQL_SDFCP;User Id=sa;Password=sql2016%%;MultipleActiveResultSets=True"
+    Private Enum TipoProcSimilaridade
+        SomaIDQCoinCerto_Div_IDQEsperado_SemRedutor
+        SomaIDQCoinCerto_Div_IDQEsperado_RedutorEstratificado
+        SomaIDQCoinCerto_Div_IDQEsperado_RedutorDifNota
+    End Enum
+    Private MinMF As Double = 0
+    Private MaxMF As Double = 0
+    Dim _auxUpdate As String = ""
+
+    ' Calcula Relação IDQ Acertos/Erros de um candidato em particular (1:0)
+    ' Ideia original de Fabrício de Oliveira Nunes
+    Function RelacaoIDQCertasErradas(respostasCand As String, gabarito As String, m_nivelDificuldade As Array)
+        Dim mRespCand() As Char = respostasCand.ToCharArray
+        Dim mGabarito() As Char = gabarito.ToCharArray
+        Dim qntQuestoes As Integer = gabarito.Length
+        Dim soma_IDQ_Acerto As Double = 0
+        Dim soma_IDQ_Erro As Double = 0
+        Dim qnt_Acertos As Integer = 0
+        Dim qnt_Erros As Integer = 0
+        For questao = 0 To qntQuestoes - 1
+            If mGabarito(questao) = mRespCand(questao) Then
+                soma_IDQ_Acerto += m_nivelDificuldade(questao)    '1 - CType(nvAcerto(questao), Double)
+                qnt_Acertos += 1
+            ElseIf mGabarito(questao) <> mRespCand(questao) Then
+                soma_IDQ_Erro += m_nivelDificuldade(questao)     ' 1 - CType(nvAcerto(questao), Double)
+                qnt_Erros += 1
+            End If
+        Next
+        Return ((soma_IDQ_Acerto / qnt_Acertos) / (soma_IDQ_Erro / qnt_Erros))
+    End Function
+
+    Function calculaSimilaridade(respostasCandA As String, respostasCandB As String, ByRef nivelDificuldade() As Double,
+                                 gabarito As String, qntQuestoes As Integer, idCandA As String,
+                                 MFCandA As Double, MFCandb As Double, tipoProcessamentoSimilaridade As Integer) _
+                                 As Double
+
+        ' Soma e obtém valor médio IDQ (Geral, sem distinção de candidato)
+        Dim vrMedioIDQ As Double = nivelDificuldade.Sum / nivelDificuldade.Length
+        Dim mRespCandA() As Char = respostasCandA.ToCharArray
+        Dim mRespCandB() As Char = respostasCandB.ToCharArray
+        Dim mGabarito() As Char = gabarito.ToCharArray
+
+        Dim iNivelDificuldade As Double
+        Dim somaIDQEsperado As Double
+
+        Dim AcertosCandA As Integer = 0
+        Dim AcertosCandB As Integer = 0
+        Dim ErrosCandA As Integer = 0
+        Dim ErrosCandB As Integer = 0
+
+        Dim maiorCoincidenciaPossivel As Integer
+        Dim acumulaIDQcoincidentes As Double = 0
+        Dim acumulaIDQCandA As Double = 0
+        Dim deprec As Double
+
+        ' Verificação similaridade 1:1 - relação soma IDQ questões coincidentes e corretas entre dois candidatos / soma max IDQ esperados
+        ' --------------------------------------------------------------------------------------------------------------------------------
+        For indice = 0 To qntQuestoes - 1    'percorre cada elemento da array segundo o tamanho informado (qntQuestoes)
+            iNivelDificuldade = nivelDificuldade(indice)
+            ' Acertos Cndt A e Cndt B
+            If mRespCandA(indice) = mGabarito(indice) Then
+                AcertosCandA += 1
+                acumulaIDQCandA += iNivelDificuldade
+            End If
+            If mRespCandB(indice) = mGabarito(indice) Then
+                AcertosCandB += 1
+            End If
+            If mRespCandA(indice) = mRespCandB(indice) And mRespCandA(indice) = mGabarito(indice) Then
+                acumulaIDQcoincidentes += iNivelDificuldade
+            End If
+        Next
+
+        ' Máximo de questões certas e coincidentes de Cndt A e Cndt B (menor qnt de acertos entre os dois)
+        If AcertosCandA >= AcertosCandB Then
+            maiorCoincidenciaPossivel = AcertosCandB
+        Else
+            maiorCoincidenciaPossivel = AcertosCandA
+        End If
+
+        ' Máximo de questões certas esperadas x Média IDQcertas Cand A = soma do IDQ Esperado
+        somaIDQEsperado = maiorCoincidenciaPossivel * (acumulaIDQCandA / AcertosCandA)
+
+        ' Calcula o redutor de acordo com o tipo de análise determinado pelo parâmetro <tipoProcessamentoSimilaridade>
+        ' ------------------------------------------------------------------------------------------------------------
+        If tipoProcessamentoSimilaridade = TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_SemRedutor Then
+            deprec = 1
+        ElseIf tipoProcessamentoSimilaridade = TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorEstratificado Then
+            ' Tamanho de cada segmento (extrato) / segmento de cada nota (Candt A, Candt B)
+            Dim Tam As Double = (MaxMF - MinMF) / 8   ' 8 extratos diferentes, ex: 60-90 = variando 30, aprox. 4 pontos por extrato
+            Dim e1 As Integer = Math.Ceiling((MFCandA - MinMF) / Tam)
+            Dim e2 As Integer = Math.Ceiling((MFCandb - MinMF) / Tam)
+            deprec = 1 - Math.Abs((e1 - e2) / 10)
+        ElseIf tipoProcessamentoSimilaridade = TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorDifNota Then
+            deprec = 1 - (Math.Abs(MFCandA - MFCandb) / MaxMF)
+        End If
+
+        ' Calcula indice de similaridade deste submétodo
+        Return (acumulaIDQcoincidentes / somaIDQEsperado) * deprec
+
+    End Function
+
+    Function executaSQLNaoQuery(comandoSQL As String, stringCon As String) As Boolean
+        Dim sqlConnection1 As System.Data.SqlClient.SqlConnection = New System.Data.SqlClient.SqlConnection(stringCon)
+        Dim cmd As System.Data.SqlClient.SqlCommand = New System.Data.SqlClient.SqlCommand()
+        cmd.CommandType = System.Data.CommandType.Text
+        cmd.CommandText = comandoSQL
+        cmd.Connection = sqlConnection1
+        sqlConnection1.Open()
+        cmd.ExecuteNonQuery()
+        sqlConnection1.Close()
+    End Function
+
+    Private Sub btProcessaSemelhanca_Click(sender As Object, e As RoutedEventArgs) Handles btProcessaSemelhanca.Click
+
+        Dim _auxUpdate As String = ""
+
+        'Open the connection.
+        Dim Conn = New SqlConnection(StringConexao)
+        Conn.Open()
+
+        ' Cria um reader e obtém os parâmetros do banco de dados de um ano específico
+        Dim CmdParam = Conn.CreateCommand
+        CmdParam.CommandText = "Select * FROM Parametros where contexto_id='" & Combo_Contextos_Processar.SelectedValue & "'"
+        Dim ReaderParametros As SqlDataReader = CmdParam.ExecuteReader()
+        ReaderParametros.Read()
+        Dim qntQuestoes = CInt(ReaderParametros("QntQuestoes").ToString())
+        Dim Gabarito = ReaderParametros("Gabarito").ToString()
+        Dim NivelAcertoQuestaoGeral = ReaderParametros("NivelAcertoQuestao").ToString()
+        Dim NivelAcertoQuestaoTop = ReaderParametros("NivelAcertoQuestaoTop").ToString()
+        Dim LimiarSuspSimilaridade = ReaderParametros("LimiarSuspeicaoRespSimilar").ToString()
+
+        ' Prepara vetor de dificuldades (Geral e Top) a partir da string de acertos
+        Dim NvDificuldadeGeral(qntQuestoes) As Double
+        Dim NvDificuldadeTop(qntQuestoes) As Double
+        Dim m_percAcertosGeral() As String = NivelAcertoQuestaoGeral.Split(";")
+        Dim m_percAcertosTop() As String = NivelAcertoQuestaoTop.Split(";")
+        Dim ind As Integer = 0
+        For Each Valor In m_percAcertosGeral
+            NvDificuldadeGeral(ind) = 1 - Valor  ' Nivel dificuldade: 1 - Acertos (Todos os candidatos)
+            ind += 1
+        Next
+        ind = 0
+        For Each Valor In m_percAcertosTop
+            NvDificuldadeTop(ind) = 1 - Valor    ' Nivel dificuldade: 1 - Acertos (Somente aproveitados)
+            ind += 1
+        Next
+
+        ' Obtém valores máximo e mínimo de notas
+        Dim CmdParamMaxMin = Conn.CreateCommand
+        CmdParamMaxMin.CommandText = "SELECT max(MediaFinal) as MaxMF, min(MediaFinal) as MinMF FROM [RespostasCandidato] where contexto_id = '" & Combo_Contextos_Processar.SelectedValue & "'"
+        Dim ReaderMaxMin As SqlDataReader = CmdParamMaxMin.ExecuteReader()
+        ReaderMaxMin.Read()
+        MinMF = ReaderMaxMin("MinMF")
+        MaxMF = ReaderMaxMin("MaxMF")
+        ReaderMaxMin.Close()
+
+        'Create a Command object para parâmetros.
+        Dim CmdRespCand = Conn.CreateCommand
+        'Todas as respostas de candidatos de um contexto
+        CmdRespCand.CommandText = "Select * FROM RespostasCandidato where contexto_id='" & Combo_Contextos_Processar.SelectedValue & "'"
+        Dim ReaderRespCand As SqlDataReader = CmdRespCand.ExecuteReader()
+
+        ' Contador do candidato atual: registra similaridades do Candidato atual com atual + 1 (não duplica registros de avaliações anteriores)
+        Dim atual As Integer = 1
+
+        ' Percorre todas as respostas de um candidato
+        Do While ReaderRespCand.Read()
+            ' variáveis dos diferentes cálculos realizados para comparação de eficiência
+            Dim maiorIndice_03 As Double = 0
+            Dim maiorIndice_04 As Double = 0
+            Dim maiorIndice_05 As Double = 0
+            Dim maiorIndice_06 As Double = 0
+            Dim maiorIndice_07 As Double = 0
+            Dim maiorIndice_08 As Double = 0
+            Dim maiorIndice As Double = 0
+            Dim _calcMetod_01 As Double = 0
+            Dim _calcMetod_02 As Double = 0
+            Dim _calcMetod_03 As Double = 0
+            Dim _calcMetod_04 As Double = 0
+            Dim _calcMetod_05 As Double = 0
+            Dim _calcMetod_06 As Double = 0
+            Dim _calcMetod_07 As Double = 0
+            Dim _calcMetod_08 As Double = 0
+            Dim CmdRespCand2 = Conn.CreateCommand
+            CmdRespCand2.CommandText = "SELECT * FROM RespostasCandidato where Candidato_id<>'" & ReaderRespCand("Candidato_id") & "' and contexto_id='" & ReaderParametros("contexto_id") & "'"
+            Dim ReaderRespCand2 As SqlDataReader = CmdRespCand2.ExecuteReader()
+            Dim atual2 As Integer = 1
+
+            ' Executa a comparação #1 : 1:0 , relação IDQ certas / IDQ erradas / Dificuldade IDQ Geral
+            _calcMetod_01 = RelacaoIDQCertasErradas(ReaderRespCand("RespostasCndt"), Gabarito, NvDificuldadeGeral)
+            _auxUpdate = ""
+            _auxUpdate += " UPDATE RespostasCandidato SET indice_01 = " & _calcMetod_01.ToString.Replace(",", ".")
+            _auxUpdate += " WHERE Candidato_id ='" & ReaderRespCand("Candidato_id") & "' and contexto_id='" & Combo_Contextos_Processar.SelectedValue & "'"
+            executaSQLNaoQuery(_auxUpdate, StringConexao)
+
+            _calcMetod_02 = RelacaoIDQCertasErradas(ReaderRespCand("RespostasCndt"), Gabarito, NvDificuldadeTop)
+            _auxUpdate = ""
+            ' Executa a comparação #2 : 1:0 , relação IDQ certas / IDQ erradas / Dificuldade IDQ Top
+            _auxUpdate = " UPDATE RespostasCandidato SET indice_02 = " & _calcMetod_02.ToString.Replace(",", ".")
+            _auxUpdate += " WHERE Candidato_id ='" & ReaderRespCand("Candidato_id") & "' and contexto_id='" & Combo_Contextos_Processar.SelectedValue & "'"
+            executaSQLNaoQuery(_auxUpdate, StringConexao)
+
+            ' Compara candidato anterior com todos exceto ele próprio para apurar maior grau de semelhança de resposta
+            Do While ReaderRespCand2.Read()
+
+                ' ==== Calcula Similaridade Método 03 (IDQ Geral, sem redutor)
+                _calcMetod_03 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeGeral,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_SemRedutor)
+                If _calcMetod_03 > maiorIndice_03 Then
+                    maiorIndice_03 = _calcMetod_03
+                End If
+
+                ' ==== Calcula Similaridade Método 04 (IDQ Top, sem redutor)
+                _calcMetod_04 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeTop,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_SemRedutor)
+                If _calcMetod_04 > maiorIndice_04 Then
+                    maiorIndice_04 = _calcMetod_04
+                End If
+
+                ' ==== Calcula Similaridade Método 05 (IDQ Geral, redutor estratificado)
+                _calcMetod_05 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeGeral,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorEstratificado)
+                If _calcMetod_05 > maiorIndice_05 Then
+                    maiorIndice_05 = _calcMetod_05
+                End If
+
+                ' ==== Calcula Similaridade Método 06 (IDQ Top, redutor estratificado)
+                _calcMetod_06 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeTop,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorEstratificado)
+                If _calcMetod_06 > maiorIndice_06 Then
+                    maiorIndice_06 = _calcMetod_06
+                End If
+
+                ' ==== Calcula Similaridade Método 07 (IDQ Geral, redutor diferença nota)
+                _calcMetod_07 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeGeral,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorDifNota)
+                If _calcMetod_07 > maiorIndice_07 Then
+                    maiorIndice_07 = _calcMetod_07
+                End If
+
+                ' ==== Calcula Similaridade Método 08 (IDQ Top, redutor diferença nota)
+                _calcMetod_08 = calculaSimilaridade(ReaderRespCand("RespostasCndt"), ReaderRespCand2("RespostasCndt"), NvDificuldadeTop,
+                                                    Gabarito, qntQuestoes, ReaderRespCand("Candidato_id"), ReaderRespCand("MediaFinal"),
+                                                    ReaderRespCand2("MediaFinal"), TipoProcSimilaridade.SomaIDQCoinCerto_Div_IDQEsperado_RedutorDifNota)
+                If _calcMetod_08 > maiorIndice_08 Then
+                    maiorIndice_08 = _calcMetod_08
+                End If
+
+                ' Registra todos as duplas de candidatos com índice de suspeição acima do limiar,mesmo que não seja a maior
+                ' (uso futuro de relacionamento entre suspeitos). Condicionado ao check box específico estar "checado".
+                ' Quando definido o método, substituir o _calcMetod_02 pelo indice de similaridade considerado
+                If (_calcMetod_05 > LimiarSuspSimilaridade Or _calcMetod_07 > LimiarSuspSimilaridade) _
+                                        And atual2 >= atual And cb_SalvaHistoricos.IsChecked Then
+                    Dim _auxInsert As String = ""
+                    If _calcMetod_05 > _calcMetod_07 Then
+                        maiorIndice = _calcMetod_05
+                    Else
+                        maiorIndice = _calcMetod_07
+                    End If
+                    _auxInsert += "INSERT INTO HistoricoSimilaridade (Contexto_id, idCand1,idCand2,indSuspeicao, stringRespCand1, stringRespCand2)"
+                    _auxInsert += " VALUES ('" & Combo_Contextos_Processar.SelectedValue & "','" & ReaderRespCand("Candidato_id") & "','" & ReaderRespCand2("Candidato_id") & "'," &
+                        maiorIndice.ToString.Replace(",", ".") & ",'" & ReaderRespCand("RespostasCndt") & "','" &
+                        ReaderRespCand2("RespostasCndt") & "')"
+                    executaSQLNaoQuery(_auxInsert, StringConexao)
+                End If
+
+                atual2 += 1
+
+            Loop
+            ' Destrói o Reader2
+            ReaderRespCand2.Close()
+            ReaderRespCand2 = Nothing
+
+            ' Registra todos os maiores índices apurados, em cada umdos métodos testados, desconsiderando limiar definido
+            _auxUpdate = " Update RespostasCandidato Set Processado='S', "
+            _auxUpdate += " indice_03=" & maiorIndice_03.ToString.Replace(",", ".") & ","
+            _auxUpdate += " indice_04=" & maiorIndice_04.ToString.Replace(",", ".") & ","
+            _auxUpdate += " indice_05=" & maiorIndice_05.ToString.Replace(",", ".") & ","
+            _auxUpdate += " indice_06=" & maiorIndice_06.ToString.Replace(",", ".") & ","
+            _auxUpdate += " indice_07=" & maiorIndice_07.ToString.Replace(",", ".") & ","
+            _auxUpdate += " indice_08=" & maiorIndice_08.ToString.Replace(",", ".")
+            _auxUpdate += " where Candidato_id='" & ReaderRespCand("Candidato_id") & "' and contexto_id='" & Combo_Contextos_Processar.SelectedValue & "'"
+            executaSQLNaoQuery(_auxUpdate, StringConexao)
+
+            atual += 1
+        Loop
+
+        'Fecha o reader e a conexão com o BD.
+        ReaderParametros.Close()
+        ReaderRespCand.Close()
+        ReaderRespCand = Nothing
+        Conn.Close()
+
+    End Sub
+
+    Private Sub btZeraTabelas_Click(sender As Object, e As RoutedEventArgs) Handles BtZeraTabelas.Click
+        ' Zera tabela de historico
+        Dim _auxInsert As String = ""
+        _auxInsert += "Delete HistoricoSimilaridade where Contexto_id='" & Combo_Contextos.SelectedValue & "'"
+        If cb_zerarHistorico.IsChecked Then
+            executaSQLNaoQuery(_auxInsert, StringConexao)
+        End If
+
+        ' Update coluna MaxIndiceSimilaridade na tabela RespostasCandidato
+        Dim _auxUpdate As String = ""
+        _auxUpdate += " Update RespostasCandidato Set indice_01=0, indice_02=0, indice_03=0, indice_04=0, indice_05=0, indice_06=0, indice_07=0, indice_08=0, " &
+                    "indice_09=0, indice_10=0, Processado='N' where contexto_id='" & Combo_Contextos.SelectedValue & "'"
+        If cb_zerarIndicesCandidatos.IsChecked Then
+            executaSQLNaoQuery(_auxUpdate, StringConexao)
+        End If
+    End Sub
+
+    Private Sub ComboContexto_Loading(sender As FrameworkElement, args As Object) Handles Combo_Contextos.Loading
+        Dim Conn = New SqlConnection(StringConexao)
+        Conn.Open()
+        ' Cria um reader e obtém os grupos de dados para teste disponíveis
+        Dim CmdParam = Conn.CreateCommand
+        CmdParam.CommandText = "SELECT contexto_id FROM Parametros"
+        Dim ReaderParametros As SqlDataReader = CmdParam.ExecuteReader()
+        While ReaderParametros.Read()
+            Combo_Contextos.Items.Add(ReaderParametros("contexto_id"))
+            Combo_Contextos_Processar.Items.Add(ReaderParametros("contexto_id"))
+        End While
+        Combo_Contextos.SelectedIndex = 0
+        Combo_Contextos_Processar.SelectedIndex = 0
+        ReaderParametros.Close()
+        ReaderParametros = Nothing
+        Conn.Close()
+    End Sub
+
+End Class
